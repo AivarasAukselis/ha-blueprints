@@ -1,0 +1,122 @@
+blueprint:
+  name: Bosch Live Progress Notification (Finish Time & Oppo Cloud)
+  description: >
+    Shows a persistent live progress bar for Bosch appliances.
+    Displays completion time (e.g., 18:15), uses important_text for Oppo's 
+    Fluid Cloud, and manages Wi-Fi dropouts.
+  domain: automation
+  input:
+    operation_state_sensor:
+      name: Operation State Sensor
+      description: The sensor indicating current state.
+      selector:
+        entity:
+          domain: sensor
+    progress_sensor:
+      name: Program Progress Sensor
+      description: The sensor showing completion (0-100).
+      selector:
+        entity:
+          domain: sensor
+    remaining_time_sensor:
+      name: Remaining Time Sensor (Hours)
+      description: Sensor showing time remaining in hours.
+      selector:
+        entity:
+          domain: sensor
+    notify_service:
+      name: Notification Service
+      default: notify.notify
+      selector:
+        text: {}
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  op_state: !input operation_state_sensor
+  prog_state: !input progress_sensor
+  time_state: !input remaining_time_sensor
+  notif_tag: "bosch_{{ op_state.split('.')[-1] }}"
+
+  device_name: "{{ state_attr(op_state, 'friendly_name') | lower }}"
+  appliance_type: >
+    {% if 'dishwasher' in device_name %} Dishwasher
+    {% elif 'oven' in device_name %} Oven
+    {% elif 'hob' in device_name or 'cooktop' in device_name %} Hob
+    {% else %} Appliance {% endif %}
+  appliance_icon: >
+    {% if 'dishwasher' in device_name %} mdi:dishwasher
+    {% elif 'oven' in device_name %} mdi:toaster-oven
+    {% elif 'hob' in device_name or 'cooktop' in device_name %} mdi:stove
+    {% else %} mdi:washing-machine {% endif %}
+
+  # --- Time Math ---
+  # Convert the sensor's hour value into total seconds
+  total_sec: "{{ (states(time_state) | float(0) * 3600) | int }}"
+  # Calculate exact completion time in HH:mm format
+  finish_time: "{{ (as_timestamp(now()) + total_sec) | timestamp_custom('%H:%M', true) }}"
+
+trigger:
+  - platform: state
+    entity_id: !input progress_sensor
+  - platform: state
+    entity_id: !input operation_state_sensor
+
+condition:
+  - condition: template
+    value_template: >
+      {{ states(op_state) in ['Run', 'Finished', 'Ready', 'Active', 'DelayedStart'] }}
+
+action:
+  - choose:
+      # CASE 1: RECOVERY FROM OFFLINE (Silent Clear)
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.from_state.state in ['unavailable', 'unknown'] and 
+                 states(op_state) in ['Finished', 'Ready'] }}
+        sequence:
+          - service: !input notify_service
+            data:
+              message: "clear_notification"
+              data:
+                tag: "{{ notif_tag }}"
+
+      # CASE 2: FINISHED
+      - conditions:
+          - condition: template
+            value_template: "{{ states(op_state) in ['Finished', 'Ready'] }}"
+          - condition: template
+            value_template: "{{ trigger.from_state.state in ['Run', 'Active'] }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              title: "✅ {{ appliance_type }} Finished"
+              message: "The {{ appliance_type | lower }} has finished its program."
+              data:
+                tag: "{{ notif_tag }}"
+                live_update: false
+                notification_icon: "{{ appliance_icon }}"
+
+      # CASE 3: RUNNING (Live Update)
+      - conditions:
+          - condition: template
+            value_template: "{{ states(op_state) in ['Run', 'Active', 'DelayedStart'] }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              title: "⏳ {{ appliance_type }} Running"
+              # Message now shows the clear finish time (e.g., 18:15)
+              message: "Finishes at {{ finish_time }}"
+              data:
+                tag: "{{ notif_tag }}"
+                live_update: true
+                alert_once: true
+                progress: "{{ states(prog_state) | int(0) }}"
+                progress_max: 100
+                chronometer: true
+                # Oppo Dynamic Island percentage
+                critical_text: "{{ states(prog_state) }}%"
+                notification_icon: "{{ appliance_icon }}"
+                when: "{{ (as_timestamp(now()) + total_sec) | int }}"
